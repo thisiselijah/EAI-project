@@ -1,0 +1,6 @@
+[submodule "FLORA"]
+	path = FLORA
+	url = https://github.com/shadowpa0327/FLORA.git
+[submodule "rockmate"]
+	path = rockmate
+	url = https://github.com/topal-team/rockmate.git
