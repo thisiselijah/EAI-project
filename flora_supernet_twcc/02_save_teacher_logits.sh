@@ -1,6 +1,6 @@
 #!/bin/bash
 # 步驟 2：離線知識蒸餾（TinyViT 方式），先用 DeiT-S teacher 存好每個 epoch 的 top-k logits
-# 每個 epoch 約 0.5 GB，300 epochs 約 150 GB → 先確認 HFS 配額
+# 每個 epoch 約 0.5 GB，300 epochs 約 150 GB → 先確認資料磁碟空間
 set -euo pipefail
 source "$(dirname "$0")/config.sh"
 cd "$FLORA_DIR"
