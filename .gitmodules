@@ -4,3 +4,6 @@
 [submodule "rockmate"]
 	path = rockmate
 	url = https://github.com/topal-team/rockmate.git
+[submodule "Cream"]
+	path = Cream
+	url = https://github.com/microsoft/Cream.git

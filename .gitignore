@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 權重、資料與輸出（太大，不放進 git）
+*.pth
+*.pt
+*.ckpt
+*.npz
+weights/
+data/
+output/
+outputs/
+logs/
+*.log
