@@ -1,0 +1,30 @@
+[project]
+name = "eai-project"
+version = "0.1.0"
+description = "Raspberry Pi 上的持續學習系統：AutoFormer NAS + rematerialization + latent replay"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+
+remat = [
+    "rockmate",
+    "rkgb",
+]
+
+[tool.uv]
+
+package = false
+
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[tool.uv.sources]
+rockmate = { path = "rockmate/rockmate", editable = true }
+rkgb = { path = "rockmate/rkgb", editable = true }
