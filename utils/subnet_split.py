@@ -9,6 +9,7 @@
 
 需要：torch、numpy（AutoFormer 的模型檔只依賴這兩個）
 """
+
 import argparse
 import os
 import sys
@@ -26,13 +27,14 @@ sys.path.insert(0, os.path.join(HERE, "..", "Cream", "AutoFormer"))
 if "torch._six" not in sys.modules:
     import collections.abc
     import types
+
     _six = types.ModuleType("torch._six")
     _six.container_abcs = collections.abc
     _six.string_classes = (str, bytes)
     _six.int_classes = int
     sys.modules["torch._six"] = _six
 from model.supernet_transformer import Vision_TransformerSuper  # noqa: E402
-from model.module.Linear_super import LinearSuper                # noqa: E402
+from model.module.Linear_super import LinearSuper  # noqa: E402
 
 # supernet-S 的最大架構（Cream/AutoFormer/experiments/supernet/supernet-S.yaml）
 SUPERNET_S = dict(embed_dim=448, depth=14, num_heads=7, mlp_ratio=4.0)
@@ -49,21 +51,30 @@ AUTOFORMER_S = dict(
 def build_supernet(ckpt_path, img_size=128, num_classes=1000):
     # 官方測試指令使用 --gp --change_qk --relative_position，這裡一併開啟
     model = Vision_TransformerSuper(
-        img_size=img_size, patch_size=16, num_classes=1000, qkv_bias=True,
-        gp=True, change_qkv=True, relative_position=True, max_relative_position=14,
-        **SUPERNET_S)
+        img_size=img_size,
+        patch_size=16,
+        num_classes=1000,
+        qkv_bias=True,
+        gp=True,
+        change_qkv=True,
+        relative_position=True,
+        max_relative_position=14,
+        **SUPERNET_S,
+    )
 
     # 權重是在 GPU 上存的，一定要 map_location='cpu'（Pi 沒有 CUDA）
     state = torch.load(ckpt_path, map_location="cpu")["model"]
 
     # 絕對位置編碼：224 輸入是 1+14×14=197 個 token，改成 img_size 時要內插
-    pe = state["pos_embed"]                                   # (1, 197, 448)
+    pe = state["pos_embed"]  # (1, 197, 448)
     n_old = int((pe.shape[1] - 1) ** 0.5)
     n_new = img_size // 16
     if n_new != n_old:
         cls_pe, grid = pe[:, :1], pe[:, 1:]
         grid = grid.reshape(1, n_old, n_old, -1).permute(0, 3, 1, 2)
-        grid = F.interpolate(grid, size=(n_new, n_new), mode="bicubic", align_corners=False)
+        grid = F.interpolate(
+            grid, size=(n_new, n_new), mode="bicubic", align_corners=False
+        )
         grid = grid.permute(0, 2, 3, 1).reshape(1, n_new * n_new, -1)
         state["pos_embed"] = torch.cat([cls_pe, grid], dim=1)
     # 相對位置編碼依序列長度動態計算，不需要調整
@@ -106,7 +117,7 @@ class Plastic(nn.Module):
 
     def forward(self, z):
         s = self.sup
-        for blk in s.blocks[self.l:]:       # 超過 layer_num 的 block 是 identity
+        for blk in s.blocks[self.l :]:  # 超過 layer_num 的 block 是 identity
             z = blk(z)
         z = s.norm(z)
         z = z[:, 1:].mean(dim=1) if s.gp else z[:, 0]
@@ -121,7 +132,10 @@ def trainable_parameters(sup, l):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default=os.path.join(HERE, "..", "..", "weights", "supernet-small.pth"))
+    ap.add_argument(
+        "--ckpt",
+        default=os.path.join(HERE, "..", "..", "weights", "supernet-small.pth"),
+    )
     ap.add_argument("--img-size", type=int, default=128)
     ap.add_argument("--latent-layer", "-l", type=int, default=9)
     ap.add_argument("--num-classes", type=int, default=50)
@@ -154,11 +168,17 @@ def main():
     t0 = time.time()
     z = frozen(x)
     t1 = time.time()
-    print(f"latent 形狀：{tuple(z.shape)}，前段推論 {1000 * (t1 - t0):.0f} ms / {args.batch} 張")
-    print(f"每筆 latent 大小（FP32）：{z[0].numel() * 4 / 1024:.1f} KB；1500 筆 buffer ≈ {1500 * z[0].numel() * 4 / 2**20:.1f} MB")
+    print(
+        f"latent 形狀：{tuple(z.shape)}，前段推論 {1000 * (t1 - t0):.0f} ms / {args.batch} 張"
+    )
+    print(
+        f"每筆 latent 大小（FP32）：{z[0].numel() * 4 / 1024:.1f} KB；1500 筆 buffer ≈ {1500 * z[0].numel() * 4 / 2**20:.1f} MB"
+    )
 
     params = trainable_parameters(sup, l)
-    print(f"可訓練參數（含未取樣到的 supernet 部分）：{sum(p.numel() for p in params) / 1e6:.2f}M")
+    print(
+        f"可訓練參數（含未取樣到的 supernet 部分）：{sum(p.numel() for p in params) / 1e6:.2f}M"
+    )
     opt = torch.optim.SGD(params, lr=0.01, momentum=0.9)
     y = torch.randint(0, args.num_classes, (args.batch,))
     t0 = time.time()
@@ -169,7 +189,9 @@ def main():
     loss.backward()
     opt.step()
     opt.zero_grad()
-    print(f"後段一次訓練步 {1000 * (time.time() - t0):.0f} ms，loss = {loss.item():.3f}")
+    print(
+        f"後段一次訓練步 {1000 * (time.time() - t0):.0f} ms，loss = {loss.item():.3f}"
+    )
 
 
 if __name__ == "__main__":
