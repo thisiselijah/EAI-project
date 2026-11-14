@@ -2,17 +2,24 @@
 
 在 Raspberry Pi 5（1 GB 訓練記憶體預算）上，結合 **NAS + rematerialization**（Chen et al., GECCO 2025）與 **Latent Replay**（Pellegrini et al., IROS 2020），在 CORe50 串流資料上持續學習新物品。
 
-## 快速開始
+## Quick Start 
 
 ```bash
-# 第一次下載（連同子模組）
 git clone --recursive https://github.com/thisiselijah/EAI-project.git
 cd EAI-project
-
-# 已經 clone 過，或子模組資料夾是空的
-git pull
-git submodule update --init --recursive
 ```
+
+### 安裝環境（uv）
+
+用 [uv](https://docs.astral.sh/uv/) 管理 Python 版本、虛擬環境和套件（設定在 `pyproject.toml`，Python 版本在 `.python-version`）：
+
+```bash
+uv sync                  # Create .venv and install dependencies
+uv sync --extra remat    # Install rockmate submodule（rematerialization，需要 C 編譯器）
+uv run python autoformer_cl/subnet_split.py -l 9
+```
+
+第一次 `uv sync` 會產生 `uv.lock`，請一起 commit。
 
 ### 下載預訓練權重（不放在 git 裡）
 
@@ -29,10 +36,8 @@ cd ../EAI-project
 
 ### 測試：切出子網路並在第 l 層分段
 
-需要 `torch` 和 `numpy`（torch 2.x 可用）。
-
 ```bash
-python autoformer_cl/subnet_split.py -l 9          # l = latent layer，可試 6 / 9 / 11
+uv run python autoformer_cl/subnet_split.py -l 9   # l = latent layer，可試 6 / 9 / 11
 ```
 
 ## 專案結構
