@@ -1,0 +1,767 @@
+diff --git a/rkgb/src/rkgb/core/partitioned.py b/rkgb/src/rkgb/core/partitioned.py
+index 9bc89e4..5f7c7c4 100644
+--- a/rkgb/src/rkgb/core/partitioned.py
++++ b/rkgb/src/rkgb/core/partitioned.py
+@@ -968,6 +968,9 @@ class PartitionedDynamicManipulation(): # only contains staticmethod
+ 
+ 
+ def make_partitioner(description):
++    if isinstance(description, Partitioner):
++        # frontend.PureRotor 直接傳入 Partitioner 物件，而非字串
++        return description
+     if description == "bottom_to_top":
+         return PartitionerBottomToTop(main_graph_as_any_other=True)
+     elif description == "repetitive":
+@@ -975,7 +978,7 @@ def make_partitioner(description):
+     elif description == "base":
+         return Partitioner()
+     else:
+-        print("[Warning] make_partitioner: unknown sub_partitioner", self.config.sub_partitioner,
++        print("[Warning] make_partitioner: unknown sub_partitioner", description,
+               "possible values:", "bottom_to_top", "repetitive")
+         return PartitionerBottomToTop(main_graph_as_any_other=True)
+ 
+diff --git a/rkgb/src/rkgb/core/raw.py b/rkgb/src/rkgb/core/raw.py
+index ff1b6ef..47398b6 100644
+--- a/rkgb/src/rkgb/core/raw.py
++++ b/rkgb/src/rkgb/core/raw.py
+@@ -240,6 +240,24 @@ class RawGraph(base.Graph):
+             if (isinstance(code,ast.Assign)
+             and not(ast_add_on.is_constant(code.value) and code.value.value is None))
+         ]
++        # Recent PyTorch codegen aliases placeholders whose name shadows a
++        # Python builtin, e.g. `input_1 = input`. Such aliases are not FX
++        # nodes, so drop them and rename their uses back to the FX node name
++        # (the names used in `dynamo_node.all_input_nodes`).
++        dynamo_arg_names = set(arg.arg for arg in dynamo_all_args)
++        dict_alias_to_arg = dict()
++        for code in list(assignment_codes):
++            if (len(code.targets) == 1
++            and isinstance(code.value, ast.Name)
++            and code.value.id in dynamo_arg_names):
++                dict_alias_to_arg[code.targets[0].id] = code.value.id
++                assignment_codes.remove(code)
++        if dict_alias_to_arg:
++            for code in assignment_codes:
++                code.value = ast_add_on.substitute_with_dict(
++                    code.value,
++                    {alias: ast.Name(arg) for alias, arg in dict_alias_to_arg.items()}
++                )
+         dict_code_target_to_code = dict()
+         for code in assignment_codes:
+             # So we can remove 'get_attr'
+diff --git a/rkgb/src/rkgb/lowlevel/device.py b/rkgb/src/rkgb/lowlevel/device.py
+new file mode 100644
+index 0000000..1b4a33b
+--- /dev/null
++++ b/rkgb/src/rkgb/lowlevel/device.py
+@@ -0,0 +1,96 @@
++"""
++Device helpers so that rkgb / rockmate can run on CPU-only machines
++(e.g. Raspberry Pi, macOS) as well as on CUDA GPUs.
++
++On CUDA every helper forwards to the corresponding `torch.cuda` call.
++On CPU, streams and events become no-op placeholders: CPU execution
++is synchronous, so there is nothing to wait for.
++"""
++import contextlib
++import torch
++
++
++def as_device(device):
++    if device is None:
++        return default_device()
++    return torch.device(device)
++
++
++def default_device():
++    """CUDA when available, otherwise CPU (keeps the old default on GPU machines)."""
++    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
++
++
++def is_cuda(device):
++    return as_device(device).type == "cuda"
++
++
++def synchronize(device=None):
++    if is_cuda(device):
++        torch.cuda.synchronize(as_device(device))
++
++
++def pin_memory_available():
++    """Pinned host memory needs a CUDA runtime; on CPU-only builds it raises."""
++    return torch.cuda.is_available()
++
++
++class NullStream:
++    """Stands in for torch.cuda.Stream on CPU."""
++
++    def synchronize(self):
++        pass
++
++    def wait_event(self, event):
++        pass
++
++    def wait_stream(self, stream):
++        pass
++
++    def query(self):
++        return True
++
++
++class NullEvent:
++    """Stands in for torch.cuda.Event on CPU."""
++
++    def record(self, stream=None):
++        pass
++
++    def wait(self, stream=None):
++        pass
++
++    def synchronize(self):
++        pass
++
++    def query(self):
++        return True
++
++
++def current_stream(device):
++    if is_cuda(device):
++        return torch.cuda.current_stream(as_device(device))
++    return NullStream()
++
++
++def new_stream(device):
++    if is_cuda(device):
++        return torch.cuda.Stream(as_device(device))
++    return NullStream()
++
++
++def stream_context(stream):
++    if isinstance(stream, NullStream):
++        return contextlib.nullcontext()
++    return torch.cuda.stream(stream)
++
++
++def stream_synchronize(stream):
++    stream.synchronize()
++
++
++def new_event(stream):
++    """Create an event on the same kind of device as `stream`."""
++    if isinstance(stream, NullStream):
++        return NullEvent()
++    return torch.cuda.Event()
+diff --git a/rkgb/src/rkgb/lowlevel/measure.py b/rkgb/src/rkgb/lowlevel/measure.py
+index 1917708..cd9fe86 100644
+--- a/rkgb/src/rkgb/lowlevel/measure.py
++++ b/rkgb/src/rkgb/lowlevel/measure.py
+@@ -141,25 +141,53 @@ class MemoryTracker:
+ 
+ class MemoryTrackerCPU(MemoryTracker):
+     """
+-    TO DO : Right now it's not usable, as we miss `maximum_value`
+-    Would be nice to add, but not urgent
+-    Could use:
+-    https://docs.python.org/3/library/tracemalloc.html
++    CPU counterpart of MemoryTrackerCUDA.
++
++    PyTorch's CPU allocator has no `memory_allocated()` counter, and process
++    RSS is far too noisy (malloc caching, Python objects) to measure a single
++    operation. Instead, `measure` runs the function under the PyTorch profiler
++    with `profile_memory=True`, which reports every allocation and free made
++    by the CPU allocator. Summing those events gives the net allocated bytes
++    (`usage`) and the running maximum gives the peak (`max_usage`), i.e. the
++    same quantities MemoryTrackerCUDA obtains from the CUDA allocator.
++
++    Allocations made outside `measure` are not tracked, so `current()` and
++    `maximum()` are only meaningful relative to one another inside `measure`.
+     """
+     def __init__(self):
+-        self.process = psutil.Process(os.getpid())
++        self.allocated = 0
+         self.max_memory = 0
+         super().__init__(torch.device("cpu"))
+     def maximum(self):
+         return self.max_memory
+     def current(self):
+-        result = int(self.process.memory_info().rss)
+-        self.max_memory = max(self.max_memory, result)
+-        return result
++        return self.allocated
+     def reset_max(self):
+-        self.max_memory = 0
+-        self.max_memory = self.current()
+-    
++        self.max_memory = self.allocated
++
++    def measure(self, func, *args):
++        from torch.profiler import profile, ProfilerActivity
++        with profile(activities=[ProfilerActivity.CPU], profile_memory=True) as prof:
++            result = func(*args)
++        events = sorted(
++            (e.start_ns(), e.nbytes())
++            for e in prof.profiler.kineto_results.events()
++            if e.name() == "[memory]"
++        )
++        current = peak = 0
++        for _, nbytes in events:
++            current += nbytes
++            peak = max(peak, current)
++        self.allocated += current
++        self.max_memory = max(self.max_memory, self.allocated)
++        self.last_memory = self.allocated
++        return result, current, peak
++
++
++def get_MemoryTracker(device):
++    if "cuda" in str(device): return MemoryTrackerCUDA(device)
++    else: return MemoryTrackerCPU()
++
+     
+ class MemoryTrackerCUDA(MemoryTracker):
+     def maximum(self):
+diff --git a/rockmate/src/rockmate/compiler.py b/rockmate/src/rockmate/compiler.py
+index 3476733..59a6d06 100644
+--- a/rockmate/src/rockmate/compiler.py
++++ b/rockmate/src/rockmate/compiler.py
+@@ -6,6 +6,7 @@ from rkgb.lowlevel.ast_add_on import (
+ )
+ from rkgb.lowlevel.constants import float_dtype
+ from rkgb.core.backward import ComputationNode, AllocationNode
++from rkgb.lowlevel import device as rk_device
+ import torch
+ import math
+ import numpy as np
+@@ -44,12 +45,14 @@ class RngState:
+     def get(self, op_name):
+         if op_name not in self.cpu_states.keys():
+             self.cpu_states[op_name] = torch.get_rng_state()
+-            self.gpu_states[op_name] = torch.cuda.get_rng_state()
++            if torch.cuda.is_available():
++                self.gpu_states[op_name] = torch.cuda.get_rng_state()
+ 
+     def restore(self, op_name):
+         # pass
+         torch.set_rng_state(self.cpu_states[op_name])
+-        torch.cuda.set_rng_state(self.gpu_states[op_name])
++        if op_name in self.gpu_states:
++            torch.cuda.set_rng_state(self.gpu_states[op_name])
+ 
+ 
+ def make_gd(
+@@ -72,12 +75,10 @@ def make_gd(
+         # "cpu_optim": optimize_metrics["cpu_optim"],
+         # "gpu_optim": optimize_metrics["gpu_optim"],
+         "optimize_metrics": optimize_metrics,
+-        "main_stream": torch.cuda.current_stream(),
+-        # "prefetch_stream": torch.cuda.current_stream(),
+-        # "offload_stream": torch.cuda.current_stream(),
+-        "prefetch_stream": torch.cuda.Stream(device),
+-        "offload_stream": torch.cuda.Stream(device),
+-        "cpu_stream": torch.cuda.Stream(device),
++        "main_stream": rk_device.current_stream(device),
++        "prefetch_stream": rk_device.new_stream(device),
++        "offload_stream": rk_device.new_stream(device),
++        "cpu_stream": rk_device.new_stream(device),
+     }
+ 
+ 
+@@ -473,7 +474,10 @@ class Fct_mem_alloc(RK_Fct):
+         else:
+             self.device = device
+         self.kwargs = kwargs
+-        if self.device == torch.device("cpu"):
++        if self.device == torch.device("cpu") and rk_device.is_cuda(
++            self.storage.gd["device"]
++        ):
++            # host buffer for offloading from GPU; no such thing when computing on CPU
+             self.kwargs["pin_memory"] = True
+         self.shape_name = target_name if shape is None else shape
+ 
+@@ -575,7 +579,7 @@ class Fct_offload(RK_Fct):
+         pass
+ 
+     def __call__(self):
+-        with torch.cuda.stream(self.storage.gd[self.stream]):
++        with rk_device.stream_context(self.storage.gd[self.stream]):
+             pass
+             self.offload_fct[self.offload_mode]()
+ 
+@@ -647,7 +651,7 @@ class Fct_prefetch(RK_Fct):
+         pass
+ 
+     def __call__(self):
+-        with torch.cuda.stream(self.storage.gd[self.stream]):
++        with rk_device.stream_context(self.storage.gd[self.stream]):
+             self.prefetch_fct[self.prefetch_mode]()
+             # torch.cuda.synchronize()
+             # with torch.cuda.stream(self.storage.gd["main_stream"]):
+@@ -661,10 +665,10 @@ class Fct_synchronize(RK_Fct):
+         self.target_name = f"Synchronize_{stream}"
+ 
+     def wait_stream(self):
+-        torch.cuda.stream(self.storage.gd[self.stream]).synchronize()
++        rk_device.stream_synchronize(self.storage.gd[self.stream])
+ 
+     def sync_all(self):
+-        torch.cuda.synchronize()
++        rk_device.synchronize(self.storage.gd["device"])
+ 
+     def __call__(self):
+         if self.stream:
+@@ -679,9 +683,11 @@ class Fct_record_event(RK_Fct):
+         self.stream = stream
+ 
+     def __call__(self):
+-        with torch.cuda.stream(self.storage.gd[self.stream]):
++        with rk_device.stream_context(self.storage.gd[self.stream]):
+             pass
+-            self.storage.events[self.target_name] = torch.cuda.Event()
++            self.storage.events[self.target_name] = rk_device.new_event(
++                self.storage.gd[self.stream]
++            )
+             self.storage.events[self.target_name].record(self.storage.gd[self.stream])
+ 
+ 
+@@ -738,7 +744,9 @@ class Fct_to_storage(RK_Fct):
+         )
+         w = self.storage.get_val(self.pnode.param_name)
+         if self.create_tensor:
+-            x = torch.empty_like(w, pin_memory=self.pin_memory)
++            x = torch.empty_like(
++                w, pin_memory=self.pin_memory and rk_device.pin_memory_available()
++            )
+             self.storage.add_val(f"cpu_{self.pnode.param_name}", torch.nn.Parameter(x))
+ 
+ 
+@@ -818,7 +826,7 @@ class Fct_manager_alloc(RK_Fct):
+             self.storage.add_val(
+                 alloc, torch.empty(size, 
+                                    device="cpu", 
+-                                   pin_memory=True, 
++                                   pin_memory=rk_device.pin_memory_available(), 
+                                    dtype=self.storage.manager.dtype)
+             )
+ 
+@@ -1341,7 +1349,7 @@ class Compiler:
+                     storage=self.storage,
+                     device=torch.device("cpu"),
+                     alloc_mode="grad",
+-                    pin_memory=True,
++                    pin_memory=rk_device.pin_memory_available(),
+                 )
+             )
+             prep_op = op
+diff --git a/rockmate/src/rockmate/rockmate.py b/rockmate/src/rockmate/rockmate.py
+index 0574f55..0fdfda2 100644
+--- a/rockmate/src/rockmate/rockmate.py
++++ b/rockmate/src/rockmate/rockmate.py
+@@ -10,7 +10,8 @@ import warnings
+ import gc
+ import rkgb
+ from rkgb.lowlevel.preprocess_samples import ExampleInputs
+-from rkgb.lowlevel.measure import tensor_memory_size, get_Timer
++from rkgb.lowlevel.measure import tensor_memory_size, get_Timer, MemoryTrackerCPU
++from rkgb.lowlevel import device as rk_device
+ from rkgb.lowlevel.constants import ref_verbose, ExceptionModuleDoesNotReqGrad
+ from rkgb.lowlevel.ast_add_on import ast_to_str, make_str_list_assign
+ from rkgb.core.partitioned import (
+@@ -57,7 +58,13 @@ class Rockmate(torch.nn.Module):
+         keep_outputs=False,
+         dynamic_batch_dim=None,
+         solve_recursive=True,
++        device=None,
+     ):
++        """
++        device: where forward/backward run. Defaults to CUDA when available,
++        otherwise CPU. On CPU the original module, its parameters and the
++        inputs must be on CPU, and offloading solvers cannot be used.
++        """
+         super().__init__()
+         ref_verbose[0] = verbose
+         self.top_solvers = top_solvers
+@@ -65,10 +72,13 @@ class Rockmate(torch.nn.Module):
+         if self.top_solvers is None and self.bottom_solvers is None:
+             self.top_solvers = [HILP()]
+             self.bottom_solvers = [HILP()]
++        # PureRotor only gives top solvers
++        self.top_solvers = self.top_solvers or []
++        self.bottom_solvers = self.bottom_solvers or []
+         self.partitioners = partitioners
+         if self.partitioners is None:
+             self.partitioners = [PartitionerBottomToTop(can_use_rotor=False)]
+-        self.device = torch.device("cuda")  # Not obtaining from model
++        self.device = rk_device.as_device(device)  # Not obtaining from model
+         self.exec_with_record_mem = False
+         self.exec_with_record_time = False
+         self.budget = budget
+@@ -88,12 +98,13 @@ class Rockmate(torch.nn.Module):
+             cpu_optim=cpu_optim,
+             optim_kwargs=optim_kwargs,
+             minor_offload_size=minor_offload_size,
++            device=self.device,
+         )
+ 
+         self.get_rkgb_result(model_inputs, model_kwargs, minor_offload_size)
+ 
+         # TODO: only measure bandwidth if needed
+-        self.bandwidth = measure_bandwidth()
++        self.bandwidth = measure_bandwidth(device=self.device)
+ 
+         self.global_dict = make_gd(
+             self.device,
+@@ -119,7 +130,7 @@ class Rockmate(torch.nn.Module):
+                     # verbose=verbose,
+                     # wanted_graphs={"FB"},
+                     partitioners=self.partitioners,
+-                    inspection_device=torch.device("cuda"),
++                    inspection_device=self.device,
+                     print_time_in_each_stage=True,
+                     dynamic_batch_dim=self.dynamic_batch_dim,
+                 )
+@@ -232,8 +243,15 @@ class Rockmate(torch.nn.Module):
+                 hilp_solver = True
+                 solver.config.optimize_metrics = self.global_dict["optimize_metrics"]
+                 if solver.config.offload:
++                    if not rk_device.is_cuda(self.device):
++                        raise ValueError(
++                            "Offloading moves tensors between GPU and host memory; "
++                            "it is not available when Rockmate runs on CPU. "
++                            "Use a solver with offload=False (e.g. PureRockmate, "
++                            "PureCheckmate, Hiremate)."
++                        )
+                     if self.bandwidth is None:
+-                        self.bandwidth = measure_bandwidth()
++                        self.bandwidth = measure_bandwidth(device=self.device)
+                     solver.config.model_kwargs["bandwidth"] = self.bandwidth
+         for solver in list_solvers:
+             if isinstance(solver, HILP):
+@@ -308,7 +326,16 @@ class Rockmate(torch.nn.Module):
+ 
+     def _exec(self, op: Op, disable=False):
+         try:
+-            if self.exec_with_record_mem:
++            if self.exec_with_record_mem and not rk_device.is_cuda(self.device):
++                if disable:
++                    allo_mem = peak_mem = 0
++                else:
++                    _, allo_mem, peak_mem = MemoryTrackerCPU().measure(op)
++                self.max_mem.append(peak_mem - allo_mem)
++                self.allo_mem.append(allo_mem)
++                op.allo_mem = allo_mem
++                op.peak_mem = peak_mem - allo_mem
++            elif self.exec_with_record_mem:
+                 torch.cuda.reset_peak_memory_stats()
+                 self.mem_before = torch.cuda.memory_allocated()
+                 self.max_before = torch.cuda.max_memory_allocated()
+@@ -333,11 +360,12 @@ class Rockmate(torch.nn.Module):
+             raise e
+ 
+     def exec_step(self, step):
++        on_cuda = rk_device.is_cuda(self.device)
++        activities = [torch.profiler.ProfilerActivity.CPU]
++        if on_cuda:
++            activities.append(torch.profiler.ProfilerActivity.CUDA)
+         with torch.profiler.profile(
+-            activities=[
+-                torch.profiler.ProfilerActivity.CPU,
+-                torch.profiler.ProfilerActivity.CUDA,
+-            ],
++            activities=activities,
+             profile_memory=True,
+         ) as p:
+             self.timer.start()
+@@ -355,13 +383,14 @@ class Rockmate(torch.nn.Module):
+             #         +step.opt_ops
+             #         +step.del_ops):
+             #     self._exec(op)
+-            torch.cuda.synchronize()
++            rk_device.synchronize(self.device)
+             self.timer.end()
+         p.export_chrome_trace(f"profiles/{len(self.step_profiles)}.json")
+         self.step_time.append(self.timer.elapsed())
+-        self.step_memory_stats.append(torch.cuda.memory_stats())
++        self.step_memory_stats.append(torch.cuda.memory_stats() if on_cuda else {})
++        sort_by = "self_cuda_time_total" if on_cuda else "self_cpu_time_total"
+         self.step_profiles.append(
+-            p.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
++            p.key_averages().table(sort_by=sort_by, row_limit=-1)
+         )
+ 
+     def init_fwd_exec(self):
+@@ -375,7 +404,7 @@ class Rockmate(torch.nn.Module):
+ 
+         for op in self.op_sched.init_op_list:
+             self._exec(op)
+-        torch.cuda.synchronize()
++        rk_device.synchronize(self.device)
+         with torch.enable_grad():
+             exec(self.init_code, self.global_dict, self.compiler.storage.ld)
+             for op in self.op_list[: self.op_sched.loss_idx + 1]:
+@@ -417,7 +446,7 @@ class Rockmate(torch.nn.Module):
+                 target.grad = self.compiler.storage.ld[v.target_name].grad
+ 
+         self.compiler.storage.ld = {}
+-        torch.cuda.synchronize()
++        rk_device.synchronize(self.device)
+ 
+     #  === nn.module's forward method wrapping self.autograd_Function.forward ===
+     def forward(self, *args, record_mem=False, record_time=False, **kwargs):
+@@ -638,10 +667,10 @@ def define_autograd_Function(RkMod: Rockmate):
+                     else:
+                         storage.ld[k] = v
+ 
+-                torch.cuda.synchronize()
++                rk_device.synchronize(RkMod.device)
+                 with torch.enable_grad():
+                     RkMod.init_fwd_exec()
+-                torch.cuda.synchronize()
++                rk_device.synchronize(RkMod.device)
+ 
+             #  *** EXECUTION PART ***
+             # -> Autograd turns off itself before giving use the control.
+diff --git a/rockmate/src/rockmate/solvers/twremat_utils.py b/rockmate/src/rockmate/solvers/twremat_utils.py
+index b65c295..5545883 100644
+--- a/rockmate/src/rockmate/solvers/twremat_utils.py
++++ b/rockmate/src/rockmate/solvers/twremat_utils.py
+@@ -80,7 +80,9 @@ def runtwremat(gr, memlimit, target, loss, verbose=False):
+     return out
+ 
+ 
+-def get_rockmate_graphs(model, sample, device="cuda"):
++def get_rockmate_graphs(model, sample, device=None):
++    from rkgb.lowlevel import device as rk_device
++    device = rk_device.as_device(device)
+     _model = deepcopy(model).to(device)
+     for _, p in _model.named_parameters():
+         if p.grad is None:
+@@ -97,7 +99,7 @@ def get_rockmate_graphs(model, sample, device="cuda"):
+     try:
+         rkgb_res = rkgb.rkgb.Result(model=_model,
+                                model_args=_sample,
+-                               inspection_device=torch.device("cuda"))
++                               inspection_device=device)
+         H_cluster = rkgb_res.hierarchical_cluster
+ 
+         ### OLD RKGB START   
+diff --git a/rockmate/src/rockmate/utils.py b/rockmate/src/rockmate/utils.py
+index 73de7ce..b19c666 100644
+--- a/rockmate/src/rockmate/utils.py
++++ b/rockmate/src/rockmate/utils.py
+@@ -1,15 +1,63 @@
+ import torch
+ from rkgb.lowlevel.measure import TimerCPU
++from rkgb.lowlevel import device as rk_device
+ from copy import deepcopy
+ 
++
++def _optimizer_state_size(optimizer):
++    return sum(
++        v.numel() * v.element_size()
++        for state in optimizer.state.values()
++        for v in state.values()
++        if isinstance(v, torch.Tensor) and v.dim() > 0
++    )
++
++
++def get_optimize_metrics_cpu(
++    _p, optim, cpu_optim=None, optim_kwargs={}, niter=20, size=1024**2
++):
++    """
++    CPU-only version of get_optimize_metrics: the "gpu" optimizer runs on the
++    CPU as well, and the optimizer state size is read from the optimizer state
++    instead of the CUDA allocator.
++    """
++    if cpu_optim is None:
++        cpu_optim = optim
++    timer = TimerCPU()
++    p = torch.nn.Parameter(torch.zeros(size, dtype=_p.dtype))
++    p.grad = torch.ones_like(p)
++    optimizer = optim([p], **optim_kwargs)
++    optimizer.step()  # creates the states
++    timer.start()
++    for _ in range(niter):
++        optimizer.step()
++    timer.end()
++    speed = size * p.element_size() * niter / timer.elapsed()
++    opt_size = _optimizer_state_size(optimizer)
++    return {
++        "cpu_optimize_speed": speed * 0.8,
++        "gpu_optimize_speed": speed,
++        "optimizer_states_factor": round(opt_size // size / p.element_size()),
++        "optimizer_overhead": 0,
++        "cpu_optim": cpu_optim,
++        "gpu_optim": optim,
++        "optim_kwargs": optim_kwargs,
++    }
++
++
+ def get_optimize_metrics(
+-    _p, optim, cpu_optim=None, optim_kwargs={}, niter=20, minor_offload_size=1024**2
++    _p, optim, cpu_optim=None, optim_kwargs={}, niter=20, minor_offload_size=1024**2,
++    device=None,
+ ):
+     # x = torch.ones(30, 1024, 1024, 1024)
+     if optim is None:
+         return None
+     if cpu_optim is None:
+         cpu_optim = optim
++    if not rk_device.is_cuda(device):
++        return get_optimize_metrics_cpu(
++            _p, optim, cpu_optim=cpu_optim, optim_kwargs=optim_kwargs, niter=niter
++        )
+     # timer = irotor.make_timer(torch.device("cpu"))
+     timer = TimerCPU()
+     # p = deepcopy(_p).to("cuda")
+@@ -76,7 +124,11 @@ def get_optimize_metrics(
+     return optimize_metrics
+ 
+ 
+-def measure_bandwidth(niter=10):
++def measure_bandwidth(niter=10, device=None):
++    if not rk_device.is_cuda(device):
++        # CPU<->GPU bandwidth is only needed for offloading, which has no
++        # meaning when everything already lives in host memory.
++        return None
+     timer = TimerCPU()
+     a_c = torch.ones([10, 1024, 1024], device="cpu", pin_memory=True)
+     a_g = torch.ones([10, 1024, 1024], device="cuda")
+diff --git a/test/test_cpu.py b/test/test_cpu.py
+new file mode 100644
+index 0000000..eef6fdf
+--- /dev/null
++++ b/test/test_cpu.py
+@@ -0,0 +1,132 @@
++"""
++Rockmate on CPU (no CUDA): correctness and memory checks.
++
++Run with:  python -m pytest rockmate/test/test_cpu.py -s
++"""
++import copy
++
++import pytest
++import torch
++import torch.nn as nn
++
++from rkgb.lowlevel.measure import MemoryTrackerCPU
++from rockmate import PureRockmate, PureRotor
++
++MiB = 1024**2
++
++
++class Block(nn.Module):
++    """Pre-norm transformer block (same layout as DeiT / AutoFormer)."""
++
++    def __init__(self, dim, heads, mlp_ratio=4):
++        super().__init__()
++        self.heads = heads
++        self.norm1 = nn.LayerNorm(dim)
++        self.qkv = nn.Linear(dim, 3 * dim)
++        self.proj = nn.Linear(dim, dim)
++        self.norm2 = nn.LayerNorm(dim)
++        self.fc1 = nn.Linear(dim, mlp_ratio * dim)
++        self.act = nn.GELU()
++        self.fc2 = nn.Linear(mlp_ratio * dim, dim)
++
++    def forward(self, x):
++        B, N, C = x.shape
++        h = self.heads
++        qkv = self.qkv(self.norm1(x)).reshape(B, N, 3, h, C // h).permute(2, 0, 3, 1, 4)
++        q, k, v = qkv[0], qkv[1], qkv[2]
++        attn = (q @ k.transpose(-2, -1)) * (C // h) ** -0.5
++        attn = attn.softmax(dim=-1)
++        y = (attn @ v).transpose(1, 2).reshape(B, N, C)
++        x = x + self.proj(y)
++        x = x + self.fc2(self.act(self.fc1(self.norm2(x))))
++        return x
++
++
++class Head(nn.Module):
++    """Trainable top of the network in latent replay: blocks + norm + classifier."""
++
++    def __init__(self, depth=4, dim=192, heads=3, classes=50):
++        super().__init__()
++        self.blocks = nn.Sequential(*[Block(dim, heads) for _ in range(depth)])
++        self.norm = nn.LayerNorm(dim)
++        self.fc = nn.Linear(dim, classes)
++
++    def forward(self, z):
++        z = self.norm(self.blocks(z))
++        return self.fc(z.mean(dim=1))
++
++
++def make_model_and_input(batch=32, tokens=65, dim=192):
++    torch.manual_seed(0)
++    model = Head(dim=dim)
++    x = torch.randn(batch, tokens, dim)
++    return model, x
++
++
++def train_step(model, x):
++    y = model(x)
++    if isinstance(y, tuple):
++        y = y[0]
++    loss = y.square().mean()
++    loss.backward()
++    return loss
++
++
++def peak_of(func, *args):
++    _, _, peak = MemoryTrackerCPU().measure(func, *args)
++    return peak
++
++
++def test_memory_tracker_cpu():
++    a = torch.randn(512, 512)  # 1 MiB
++
++    def f():
++        b = a @ a  # 1 MiB, kept
++        c = torch.relu(b)  # 1 MiB, freed
++        del c
++        return b
++
++    _, usage, peak = MemoryTrackerCPU().measure(f)
++    assert usage == pytest.approx(1 * MiB, rel=0.01)
++    assert peak == pytest.approx(2 * MiB, rel=0.01)
++
++
++@pytest.mark.parametrize(
++    "rk_class,budget_ratio",
++    [(PureRockmate, 1.0), (PureRockmate, 0.5), (PureRotor, 0.5)],
++)
++def test_gradients_match_pytorch(rk_class, budget_ratio):
++    model, x = make_model_and_input()
++    ref = copy.deepcopy(model)
++    act_peak = peak_of(train_step, copy.deepcopy(model), x)
++
++    rk = rk_class(model, [x], budget=act_peak * budget_ratio, device="cpu")
++    for _ in range(2):  # 1st call runs the init path, 2nd the steady state
++        rk.zero_grad()
++        ref.zero_grad()
++        loss_rk = train_step(rk, x)
++        loss_ref = train_step(ref, x)
++        assert torch.allclose(loss_rk, loss_ref, rtol=1e-5, atol=1e-6)
++        for (name, p_rk), (_, p_ref) in zip(
++            model.named_parameters(), ref.named_parameters()
++        ):
++            assert p_rk.grad is not None, name
++            assert torch.allclose(p_rk.grad, p_ref.grad, rtol=1e-4, atol=1e-6), name
++
++
++def test_peak_memory_below_budget():
++    model, x = make_model_and_input(batch=64)
++    pt_peak = peak_of(train_step, copy.deepcopy(model), x)
++    budget = 0.5 * pt_peak
++    rk = PureRockmate(model, [x], budget=budget, device="cpu")
++    train_step(rk, x)  # warm-up: init path allocates placeholders
++    rk.zero_grad()
++    rk_peak = peak_of(train_step, rk, x)
++    print(
++        f"\nPyTorch peak {pt_peak / MiB:.1f} MiB | budget {budget / MiB:.1f} MiB | "
++        f"Rockmate simulated {rk.op_sched.peak_mem / MiB:.1f} MiB | "
++        f"Rockmate measured {rk_peak / MiB:.1f} MiB"
++    )
++    assert rk_peak < pt_peak
++    # small tolerance: gradients of parameters are allocated by autograd
++    assert rk_peak <= budget * 1.10
