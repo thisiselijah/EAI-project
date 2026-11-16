@@ -5,7 +5,7 @@
 給 latent replay 持續學習使用。
 
 用法（在 EAI-project 根目錄執行）：
-  python autoformer_cl/subnet_split.py --ckpt ../weights/supernet-small.pth --img-size 128 --latent-layer 9
+  python -m utils.subnet_split --ckpt weights/supernet-small.pth --img-size 128 --latent-layer 9
 
 需要：torch、numpy（AutoFormer 的模型檔只依賴這兩個）
 """
@@ -134,7 +134,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--ckpt",
-        default=os.path.join(HERE, "..", "..", "weights", "supernet-small.pth"),
+        default=os.path.join(HERE, "..", "weights", "supernet-small.pth"),
     )
     ap.add_argument("--img-size", type=int, default=128)
     ap.add_argument("--latent-layer", "-l", type=int, default=9)
