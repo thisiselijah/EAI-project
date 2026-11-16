@@ -84,6 +84,38 @@
 
 第 1 項已完成；第 2 項是其他工作的基礎，也是 AutoFormer 能交給 Rockmate 的前提，接著做。
 
+**Pi 4 上的第一輪測試（M1：環境和 Rockmate 驗證）**
+
+目前只能測環境和 Rockmate；Learn mode 要等訓練迴圈、AutoFormer 匯出和量測腳本寫好。結果記在這份 TODO（或貼回來整理）。
+
+- [ ] **0. 準備**
+  - [ ] 確認 Pi 4 的記憶體大小（2 / 4 / 8 GB）。
+  - [ ] 裝 64 位元 Raspberry Pi OS：`uname -m` 要是 `aarch64`。
+  - [ ] 散熱片和風扇裝好。
+  - [ ] 在 Mac 上把分支 push 上去：`git push -u origin feature/training-on-pi`。
+- [ ] **1. 環境**
+  - [ ] memory cgroup：`cat /sys/fs/cgroup/cgroup.controllers` 要有 `memory`。沒有的話在 `/boot/firmware/cmdline.txt` 加上 `cgroup_enable=memory cgroup_memory=1`，然後重開機。
+  - [ ] `sudo apt install -y build-essential`（rotor 的 C 擴充要編譯）。
+  - [ ] `git clone --recurse-submodules -b feature/training-on-pi <repo> && cd EAI-project`
+  - [ ] 套用 Rockmate CPU patch：`git -C rockmate apply ../patches/rockmate-cpu.patch`。這一步會產生 `rockmate/test/test_cpu.py`；沒套用的話，後面的測試檔不存在，Rockmate 也還是原本只支援 CUDA 的版本。
+  - [ ] `uv sync --extra remat`
+  - [ ] PyTorch 能跑：`uv run python -c "import torch; x=torch.randn(512,512); print(torch.__version__, (x@x).sum())"`。出現 `Illegal instruction` 就要換較舊的 torch（Pi 4 是 ARMv8.0）。
+  - [ ] 從 Mac 傳權重：`scp weights/*.pth <pi>:~/EAI-project/weights/`
+- [ ] **2. Rockmate 正確性**：`uv run python -m pytest rockmate/test/test_cpu.py -s`
+  - [ ] 5 項測試全過（梯度和 PyTorch 一致、峰值壓在預算內）。
+  - [ ] 記下每項測試的時間（主要是求解時間）。
+  - [ ] PureRockmate 需要 CBC 求解器；pulp 內建的版本不一定有 ARM 版，缺的話 `sudo apt install coinor-cbc`。預設的 PureRotor 不需要。
+- [ ] **3. remat 實測**：`uv run python -m utils.remat --budget-ratio 0.5`
+  - [ ] 記下：原本的峰值和每步時間、remat 後的峰值和每步時間、時間倍率、求解時間。
+  - [ ] 加上 1 GB 限制再跑一次，必須關掉 swap，否則超出的部分會被換到 swap，等於沒限制：
+    `sudo systemd-run --scope -p MemoryMax=1G -p MemorySwapMax=0 --uid=$USER uv run python -m utils.remat --budget-ratio 0.5`
+  - [ ] 跑的時候另開終端機記錄溫度和時脈：`watch -n 2 'vcgencmd measure_temp; vcgencmd measure_clock arm'`，有降頻要標記。
+- [ ] **4. Python + PyTorch 本身的記憶體**（`perf.step_budget()` 的 `runtime_bytes`）：
+  `uv run python -c "import torch, psutil; print(psutil.Process().memory_info().rss/2**20, 'MiB')"`
+- [ ] **5. AutoFormer-S 實測**：`uv run python -m utils.subnet_split -l 9 --batch 32`，再試 `-l 6`、`-l 11`。
+  - [ ] 記下凍結層的推論時間、後段一次訓練步的時間。
+  - [ ] 和 Mac 的數字比較，得到 Pi 4 的速度倍率，用來修正「Pi 4 的速度」那項風險的粗估。
+
 **現有程式碼**
 - `utils/subnet_split.py`：載入 supernet-S（128×128）並切成 Frozen / Plastic，目前只寫死 AutoFormer-S。
 - `utils/nas.py`：空殼，演化搜尋要寫在這裡。可參考 `Cream/AutoFormer/evolution.py`（原本的限制是參數量，要換成 Algorithm 1）。
