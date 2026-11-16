@@ -14,6 +14,7 @@ dependencies = [
 remat = [
     "rockmate",
     "rkgb",
+    "pyyaml",          # rockmate.frontend 會 import yaml，但上游沒列進依賴
 ]
 
 [tool.uv]

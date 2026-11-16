@@ -12,7 +12,6 @@ venv/
 *.pt
 *.ckpt
 *.npz
-weights/
 data/
 output/
 outputs/
